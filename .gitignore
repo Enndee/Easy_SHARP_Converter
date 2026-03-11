@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+release_pkg/
+easy_sharp_settings.json
+ml-sharp/
+Easy
+Easy_SHARP_Converter.spec
+splatapult/build/
