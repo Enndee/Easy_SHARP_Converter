@@ -137,7 +137,7 @@ REM Write a quick README
     echo.
     echo USAGE
     echo   - Double-click Easy_SHARP_Converter.exe and use the file picker, OR
-    echo   - Right-click any JPEG/PNG -> Send To -> Easy SHARP Converter
+    echo   - Right-click any JPEG/PNG -^> Send To -^> Easy SHARP Converter
     echo     (Setup_NewPC.bat creates the Send To shortcut automatically^)
     echo   - Double-click splat files in the GUI to open them in the configured viewer
     echo.
