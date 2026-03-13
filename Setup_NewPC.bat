@@ -7,10 +7,11 @@ echo =====================================================
 echo.
 echo This script will:
 echo   1. Locate Anaconda or Miniconda reliably on Windows
-echo   2. Create the 'sharp' conda environment (Python 3.13)
-echo   3. Install PyTorch with CUDA 12.8 BEFORE ml-sharp
-echo   4. Install Apple's ml-sharp package from GitHub
-echo   5. Create a Send To shortcut for Easy SHARP Converter
+echo   2. Verify git is available
+echo   3. Create the 'sharp' conda environment (Python 3.13)
+echo   4. Install PyTorch with CUDA 12.8 BEFORE ml-sharp
+echo   5. Install Apple's ml-sharp package from GitHub
+echo   6. Create a Send To shortcut for Easy SHARP Converter
 echo.
 echo Press any key to continue, or Ctrl+C to cancel.
 pause >nul
@@ -20,7 +21,7 @@ set "CONDA_BASE="
 set "CONDA_CMD="
 
 echo.
-echo [1/5] Locating conda...
+echo [1/7] Locating conda...
 for %%B in (
     "%USERPROFILE%\anaconda3"
     "%USERPROFILE%\miniconda3"
@@ -70,7 +71,7 @@ exit /b 1
 echo       OK - conda found at %CONDA_BASE%
 
 echo.
-echo [2/5] Checking for git...
+echo [2/7] Checking for git...
 where git >nul 2>&1
 if errorlevel 1 (
     echo.
@@ -86,7 +87,7 @@ if errorlevel 1 (
 echo       OK - git found.
 
 echo.
-echo [3/5] Creating conda environment 'sharp' with Python 3.13...
+echo [3/7] Creating conda environment 'sharp' with Python 3.13...
 call "%CONDA_CMD%" env list | findstr /R /C:"^[* ]*sharp[ ]" >nul 2>&1
 if not errorlevel 1 (
     echo       Environment 'sharp' already exists -- skipping creation.
@@ -101,7 +102,7 @@ if errorlevel 1 (
 
 :install_torch
 echo.
-echo [4/5] Installing PyTorch with CUDA 12.8 support...
+echo [4/7] Installing PyTorch with CUDA 12.8 support...
 echo       IMPORTANT: This must happen before ml-sharp to avoid CPU-only torch.
 echo       This may take a few minutes...
 call "%CONDA_CMD%" run -n sharp pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
@@ -121,7 +122,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [5/5] Installing ml-sharp from GitHub...
+echo [5/7] Installing ml-sharp from GitHub...
 echo       Step 1: Cloning repository (this may take 1-2 minutes, please wait)...
 echo       Step 2: Installing dependencies (another 1-2 minutes)...
 echo       If it appears stuck after the git clone line, it is still working.
@@ -136,7 +137,8 @@ if errorlevel 1 (
 echo       OK - ml-sharp installed.
 
 echo.
-echo [Bonus] Creating Send To shortcut...
+echo.
+echo [6/6] Creating Send To shortcut...
 set "EXE_PATH=%SCRIPT_DIR%Easy_SHARP_Converter.exe"
 if not exist "%EXE_PATH%" (
     echo       WARNING: Easy_SHARP_Converter.exe was not found next to this script.

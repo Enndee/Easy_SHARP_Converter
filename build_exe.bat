@@ -2,9 +2,10 @@
 setlocal EnableDelayedExpansion
 
 set "APP_NAME=Easy_SHARP_Converter"
-set "RELEASE_VERSION=1.0.0"
+set "RELEASE_VERSION=1.5"
 set "PACKAGE_DIR=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows"
 set "ZIP_PATH=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows.zip"
+set "VIEWER_SOURCE=splatapult\build\Release"
 
 echo =====================================================
 echo  Easy SHARP Converter  --  Build EXE
@@ -111,7 +112,13 @@ copy /Y "Setup_NewPC.bat" "%PACKAGE_DIR%\" >nul
 copy /Y "gsbox.exe" "%PACKAGE_DIR%\" >nul
 
 if not exist "%PACKAGE_DIR%\splatapult\build\Release" mkdir "%PACKAGE_DIR%\splatapult\build\Release"
-xcopy /E /I /Y "splatapult\build\Release\*" "%PACKAGE_DIR%\splatapult\build\Release\" >nul
+if exist "%VIEWER_SOURCE%\*" (
+    xcopy /E /I /Y "%VIEWER_SOURCE%\*" "%PACKAGE_DIR%\splatapult\build\Release\" >nul
+) else (
+    echo WARNING: Could not find splatapult viewer files in %VIEWER_SOURCE%.
+    echo          The v%RELEASE_VERSION% package will be built without the bundled viewer payload.
+    rmdir /S /Q "%PACKAGE_DIR%\splatapult" >nul 2>&1
+)
 
 if exist "easy_sharp_settings.json" del /Q "%PACKAGE_DIR%\easy_sharp_settings.json" >nul 2>&1
 
@@ -135,12 +142,17 @@ REM Write a quick README
     echo   - Double-click splat files in the GUI to open them in the configured viewer
     echo.
     echo FOLDER STRUCTURE
-    echo   Easy_SHARP_Converter.exe  <- launcher
-    echo   gsbox.exe                  <- format conversion helper
-    echo   splatapult\build\Release\ <- bundled viewer files
-    echo   Launch_Easy_SHARP.bat      <- script launcher
-    echo   Setup_NewPC.bat           <- one-time environment installer
+    echo   Easy_SHARP_Converter.exe  - launcher
+    echo   gsbox.exe                 - format conversion helper
+    echo   Launch_Easy_SHARP.bat     - script launcher
+    echo   Setup_NewPC.bat           - one-time environment installer
 ) > "%PACKAGE_DIR%\README.txt"
+
+if exist "%PACKAGE_DIR%\splatapult\build\Release" (
+    >> "%PACKAGE_DIR%\README.txt" echo   splatapult\build\Release\ - bundled viewer files
+) else (
+    >> "%PACKAGE_DIR%\README.txt" echo   Viewer payload not bundled in this package.
+)
 
 echo.
 echo [5/5] Creating zip archive...
@@ -158,4 +170,3 @@ echo.
 echo  Folder: %PACKAGE_DIR%
 echo  Zip:    %ZIP_PATH%
 echo =====================================================
-pause

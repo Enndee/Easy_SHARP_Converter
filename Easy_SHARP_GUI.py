@@ -19,7 +19,7 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from PIL import Image, ImageDraw, ImageOps, ImageTk, ExifTags
+from PIL import Image, ImageDraw, ImageOps, ImageTk, ExifTags, TiffImagePlugin
 from plyfile import PlyData, PlyElement
 
 
@@ -99,6 +99,10 @@ def _format_mb(file_path):
         return ""
 
 
+def _format_duration(seconds):
+    return f"{seconds:.2f}s"
+
+
 def _default_splat_viewer_path():
     candidates = [
         os.path.join(EXE_DIR, "splatapult", "build", "Release", "splatapult.exe"),
@@ -116,7 +120,10 @@ def _default_settings():
         "output_folder": "",
         "workers": 2,
         "device": "cuda",
+        "fallback_focal": "",
         "format": "ply",
+        "quality": 5,
+        "sh_degree": 0,
         "trans_x": "",
         "trans_y": "",
         "trans_z": "",
@@ -247,10 +254,10 @@ def clean_ply_file(input_file, output_file):
     PlyData([plydata["vertex"]], text=False).write(output_file)
 
 
-def convert_to_ply(input_file, output_file, gsbox_exe):
+def convert_to_ply(input_file, output_file, gsbox_exe, env=None, cwd=None):
     extension = os.path.splitext(input_file)[1].lower()
     if extension == ".ply":
-        clean_ply_file(input_file, output_file)
+        shutil.copy2(input_file, output_file)
         return
 
     command_map = {
@@ -262,7 +269,7 @@ def convert_to_ply(input_file, output_file, gsbox_exe):
     if not command_name:
         raise RuntimeError(f"Unsupported input format: {extension}")
 
-    result = run_process([gsbox_exe, command_name, "-i", input_file, "-o", output_file])
+    result = run_process([gsbox_exe, command_name, "-i", input_file, "-o", output_file], env=env, cwd=cwd)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or f"gsbox {command_name} failed").strip())
 
@@ -300,6 +307,26 @@ def extract_focal_length(image_path):
     return None
 
 
+def copy_image_with_fallback_focal(source_path, output_path, fallback_focal):
+    if fallback_focal is None:
+        shutil.copy2(source_path, output_path)
+        return False
+
+    if extract_focal_length(source_path) is not None:
+        shutil.copy2(source_path, output_path)
+        return False
+
+    with Image.open(source_path) as image:
+        image = ImageOps.exif_transpose(image)
+        exif = image.getexif() or Image.Exif()
+        if TAG_FOCAL:
+            exif[TAG_FOCAL] = TiffImagePlugin.IFDRational(float(fallback_focal))
+        if TAG_FOCAL_35:
+            exif[TAG_FOCAL_35] = int(round(float(fallback_focal)))
+        image.save(output_path, format=image.format, exif=exif)
+    return True
+
+
 def load_thumbnail_payload(image_path, background_color):
     with Image.open(image_path) as image:
         image = ImageOps.exif_transpose(image)
@@ -322,12 +349,14 @@ def load_thumbnail_payload(image_path, background_color):
         return background, focal, pixel_size
 
 
-def run_process(command, *, shell=False):
+def run_process(command, *, shell=False, env=None, cwd=None):
     return subprocess.run(
         command,
         shell=shell,
         capture_output=True,
         text=True,
+        env=env,
+        cwd=cwd,
         creationflags=_creationflags(),
     )
 
@@ -353,6 +382,11 @@ class App(tk.Tk):
         self._selectable_paths = []
         self._anchor_index = None
         self._hovered_path = None
+        self._browser_folders = []
+        self._browser_images = []
+        self._browser_splats = []
+        self._browser_columns = 0
+        self._browser_resize_after_id = None
         self._section_bodies = {}
         self._section_toggle_buttons = {}
         self._collapsed_sections = dict(self._settings.get("collapsed_sections", {}))
@@ -362,7 +396,10 @@ class App(tk.Tk):
         self.output_folder_var = tk.StringVar(value=self._settings.get("output_folder", ""))
         self.device_var = tk.StringVar(value=self._settings.get("device", "cuda"))
         self.workers_var = tk.IntVar(value=max(1, int(self._settings.get("workers", 2))))
+        self.fallback_focal_var = tk.StringVar(value=self._settings.get("fallback_focal", ""))
         self.format_var = tk.StringVar(value=self._settings.get("format", "ply"))
+        self.quality_var = tk.IntVar(value=min(9, max(1, int(self._settings.get("quality", 5)))))
+        self.sh_degree_var = tk.IntVar(value=min(3, max(0, int(self._settings.get("sh_degree", 0)))))
         self.path_var = tk.StringVar(value=self._settings.get("last_browse_folder", EXE_DIR))
         self.gsbox_var = tk.StringVar(value=self._settings.get("gsbox_path", ""))
         self.splat_viewer_var = tk.StringVar(value=self._settings.get("splat_viewer_path", ""))
@@ -392,6 +429,7 @@ class App(tk.Tk):
         self.progress_value_var = tk.DoubleVar(value=0)
         self._progress_total = 1
         self._progress_completed = 0
+        self._log_file_path = os.path.join(EXE_DIR, "easy_sharp_converter.log")
 
         self._placeholder_photo = self._build_placeholder_photo()
         self._folder_photo = self._build_folder_photo()
@@ -403,6 +441,7 @@ class App(tk.Tk):
         self._sync_output_mode()
         self._check_tools()
         self.bind_all("<Delete>", self._on_delete_key, add=True)
+        self._log(f"Session started. Log file: {self._log_file_path}", "dim")
 
         target = initial_target or self.path_var.get()
         self.after(50, lambda: self._open_initial_target(target))
@@ -468,7 +507,10 @@ class App(tk.Tk):
             "output_mode": self.output_mode_var,
             "output_folder": self.output_folder_var,
             "device": self.device_var,
+            "fallback_focal": self.fallback_focal_var,
             "format": self.format_var,
+            "quality": self.quality_var,
+            "sh_degree": self.sh_degree_var,
             "gsbox_path": self.gsbox_var,
             "splat_viewer_path": self.splat_viewer_var,
         }
@@ -564,9 +606,9 @@ class App(tk.Tk):
         self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._button(custom_row, "Browse", self._browse_output_folder).pack(side=tk.LEFT, padx=(8, 0))
 
-        process_box = self._create_collapsible_card(parent, "processing", "Processing")
+        sharp_box = self._create_collapsible_card(parent, "sharp", "SHARP")
 
-        control_row = tk.Frame(process_box, bg=BG2)
+        control_row = tk.Frame(sharp_box, bg=BG2)
         control_row.pack(fill=tk.X, pady=(0, 8))
         workers_row = tk.Frame(control_row, bg=BG2)
         workers_row.pack(side=tk.LEFT)
@@ -593,6 +635,16 @@ class App(tk.Tk):
         self._radio(device_buttons, "CUDA", self.device_var, "cuda").pack(side=tk.LEFT, padx=(0, 12))
         self._radio(device_buttons, "CPU", self.device_var, "cpu").pack(side=tk.LEFT)
 
+        focal_row = tk.Frame(sharp_box, bg=BG2)
+        focal_row.pack(fill=tk.X)
+        tk.Label(focal_row, text="Fallback focal mm (if EXIF missing)", bg=BG2, fg=FG, font=("Segoe UI", 10)).pack(anchor="w")
+        focal_input_row = tk.Frame(focal_row, bg=BG2)
+        focal_input_row.pack(fill=tk.X, pady=(4, 0))
+        self._entry(focal_input_row, self.fallback_focal_var, width=10).pack(side=tk.LEFT)
+        tk.Label(focal_input_row, text="Blank keeps EXIF-only behavior", bg=BG2, fg=FG_DIM, font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(10, 0))
+
+        process_box = self._create_collapsible_card(parent, "processing", "Processing")
+
         format_row = tk.Frame(process_box, bg=BG2)
         format_row.pack(fill=tk.X)
         tk.Label(format_row, text="Output format", bg=BG2, fg=FG, font=("Segoe UI", 10)).pack(anchor="w")
@@ -602,6 +654,43 @@ class App(tk.Tk):
         self._radio(fmt_buttons, ".spx", self.format_var, "spx").pack(side=tk.LEFT, padx=(0, 14))
         self._radio(fmt_buttons, ".spz", self.format_var, "spz").pack(side=tk.LEFT, padx=(0, 14))
         self._radio(fmt_buttons, ".sog", self.format_var, "sog").pack(side=tk.LEFT)
+
+        export_options_row = tk.Frame(process_box, bg=BG2)
+        export_options_row.pack(fill=tk.X, pady=(10, 0))
+
+        quality_group = tk.Frame(export_options_row, bg=BG2)
+        quality_group.pack(side=tk.LEFT, padx=(0, 18))
+        tk.Label(quality_group, text="Quality (1-9, default 5)", bg=BG2, fg=FG, font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Spinbox(
+            quality_group,
+            from_=1,
+            to=9,
+            textvariable=self.quality_var,
+            width=6,
+            font=("Segoe UI", 10),
+            bg=BG3,
+            fg=FG,
+            insertbackground=FG,
+            relief=tk.FLAT,
+            buttonbackground=BG4,
+        ).pack(anchor="w", pady=(4, 0))
+
+        sh_group = tk.Frame(export_options_row, bg=BG2)
+        sh_group.pack(side=tk.LEFT)
+        tk.Label(sh_group, text="SH degree (0-3, default 0)", bg=BG2, fg=FG, font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Spinbox(
+            sh_group,
+            from_=0,
+            to=3,
+            textvariable=self.sh_degree_var,
+            width=6,
+            font=("Segoe UI", 10),
+            bg=BG3,
+            fg=FG,
+            insertbackground=FG,
+            relief=tk.FLAT,
+            buttonbackground=BG4,
+        ).pack(anchor="w", pady=(4, 0))
 
         info_box = self._card(parent, fill=BG3)
         info_box.pack(fill=tk.X, pady=(0, 10))
@@ -754,6 +843,8 @@ class App(tk.Tk):
         self.browser_canvas.bind("<Configure>", self._on_browser_resize)
         self.browser_canvas.bind("<Return>", self._open_selected_files)
         self.browser_canvas.bind("<KP_Enter>", self._open_selected_files)
+        self.browser_canvas.bind("<Control-a>", self._select_all_files)
+        self.browser_canvas.bind("<Control-A>", self._select_all_files)
         self.browser_canvas.bind_all("<MouseWheel>", self._on_mousewheel, add=True)
 
     def _section_label(self, parent, text):
@@ -807,6 +898,26 @@ class App(tk.Tk):
             borderwidth=0,
         )
 
+    def _checkbutton(self, parent, text, variable):
+        return tk.Checkbutton(
+            parent,
+            text=text,
+            variable=variable,
+            onvalue=True,
+            offvalue=False,
+            bg=parent.cget("bg"),
+            fg=FG,
+            selectcolor=BG4,
+            activebackground=parent.cget("bg"),
+            activeforeground=FG,
+            font=("Segoe UI", 10),
+            highlightthickness=0,
+            bd=0,
+            padx=0,
+            pady=0,
+            anchor="w",
+        )
+
     def _entry(self, parent, variable, width=None):
         return tk.Entry(
             parent,
@@ -820,6 +931,8 @@ class App(tk.Tk):
             highlightthickness=1,
             highlightbackground=INPUT_BORDER,
             highlightcolor=ACCENT,
+            disabledbackground=BG3,
+            disabledforeground=FG_DIM,
             bd=0,
         )
 
@@ -857,6 +970,11 @@ class App(tk.Tk):
             self.log_widget.insert(tk.END, f"[{timestamp}] {message}\n", tag)
             self.log_widget.see(tk.END)
             self.log_widget.configure(state=tk.DISABLED)
+            try:
+                with open(self._log_file_path, "a", encoding="utf-8") as handle:
+                    handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+            except Exception:
+                pass
 
         self.after(0, append)
 
@@ -1018,6 +1136,9 @@ class App(tk.Tk):
         self._preview_image_by_stem = {}
         for entry in images:
             self._preview_image_by_stem.setdefault(os.path.splitext(entry.name)[0].lower(), entry.path)
+        self._browser_folders = folders
+        self._browser_images = images
+        self._browser_splats = splats
         self._render_browser(folders, images, splats)
         self._update_selection_ui()
 
@@ -1113,12 +1234,19 @@ class App(tk.Tk):
 
     def _on_browser_resize(self, event):
         self.browser_canvas.itemconfigure(self.browser_window, width=event.width)
-        self.after_idle(self._rerender_cards)
+        columns = max(1, event.width // CARD_WIDTH)
+        if columns == self._browser_columns:
+            return
+        if self._browser_resize_after_id is not None:
+            self.after_cancel(self._browser_resize_after_id)
+        self._browser_resize_after_id = self.after(90, self._rerender_cards)
 
     def _on_left_resize(self, event):
         self.left_canvas.itemconfigure(self.left_window, width=event.width)
 
     def _set_card_hover(self, path):
+        if self._hovered_path == path:
+            return
         self._hovered_path = path
         self._refresh_card_selection()
 
@@ -1184,6 +1312,16 @@ class App(tk.Tk):
             self._log(f"{len(failed)} file(s) could not be deleted.", "warn")
         self._refresh_file_browser()
 
+    def _select_all_files(self, _event=None):
+        if not self._selectable_paths:
+            return "break"
+        self.browser_canvas.focus_set()
+        self._selected_paths = list(self._selectable_paths)
+        self._anchor_index = 0
+        self._refresh_card_selection()
+        self._update_selection_ui()
+        return "break"
+
     def _render_browser(self, folders, images, splats):
         for child in self.browser_inner.winfo_children():
             child.destroy()
@@ -1200,6 +1338,8 @@ class App(tk.Tk):
             return
 
         columns = max(1, self.browser_canvas.winfo_width() // CARD_WIDTH)
+        self._browser_columns = columns
+        self._browser_resize_after_id = None
         for index, (kind, path, name) in enumerate(items):
             row = index // columns
             column = index % columns
@@ -1247,8 +1387,8 @@ class App(tk.Tk):
             for widget in (frame, thumb_holder, name_label, meta_label, size_label):
                 widget.bind("<Button-1>", lambda event, rec=record: self._on_card_click(event, rec))
                 widget.bind("<Double-Button-1>", lambda event, rec=record: self._on_card_double_click(event, rec))
-                widget.bind("<Enter>", lambda _event, item_path=path: self._set_card_hover(item_path))
-                widget.bind("<Leave>", lambda _event, item_path=path: self._clear_card_hover(item_path))
+            frame.bind("<Enter>", lambda _event, item_path=path: self._set_card_hover(item_path))
+            frame.bind("<Leave>", lambda _event, item_path=path: self._clear_card_hover(item_path))
 
             if kind == "folder":
                 thumb_holder.configure(image=self._folder_photo)
@@ -1275,23 +1415,7 @@ class App(tk.Tk):
     def _rerender_cards(self):
         if not self._current_dir:
             return
-        try:
-            entries = list(os.scandir(self._current_dir))
-        except OSError:
-            return
-        folders = sorted((entry for entry in entries if entry.is_dir()), key=lambda item: item.name.lower())
-        images = sorted(
-            (entry for entry in entries if entry.is_file() and os.path.splitext(entry.name)[1].lower() in IMAGE_EXTENSIONS),
-            key=lambda item: item.name.lower(),
-        )
-        splats = sorted(
-            (entry for entry in entries if entry.is_file() and os.path.splitext(entry.name)[1].lower() in SPLAT_EXTENSIONS),
-            key=lambda item: item.name.lower(),
-        )
-        self._preview_image_by_stem = {}
-        for entry in images:
-            self._preview_image_by_stem.setdefault(os.path.splitext(entry.name)[0].lower(), entry.path)
-        self._render_browser(folders, images, splats)
+        self._render_browser(self._browser_folders, self._browser_images, self._browser_splats)
         self._refresh_card_selection()
 
     def _find_matching_image(self, file_path):
@@ -1459,6 +1583,27 @@ class App(tk.Tk):
             self._log("Invalid SHARP instance count.", "err")
             return None
 
+        try:
+            fallback_focal = _safe_float(self.fallback_focal_var.get())
+        except ValueError:
+            self._log("Invalid fallback focal length. Use a numeric value in mm.", "err")
+            return None
+        if fallback_focal is not None and fallback_focal <= 0:
+            self._log("Fallback focal length must be greater than zero.", "err")
+            return None
+
+        try:
+            quality = min(9, max(1, int(self.quality_var.get())))
+        except Exception:
+            self._log("Invalid output quality. Use a value from 1 to 9.", "err")
+            return None
+
+        try:
+            sh_degree = min(3, max(0, int(self.sh_degree_var.get())))
+        except Exception:
+            self._log("Invalid SH degree. Use a value from 0 to 3.", "err")
+            return None
+
         gsbox_exe = find_gsbox_exe(self.gsbox_var.get())
         fmt = self.format_var.get()
         selected_extensions = {os.path.splitext(path)[1].lower() for path in selected_paths}
@@ -1524,7 +1669,10 @@ class App(tk.Tk):
             "workers": workers,
             "conversion_workers": max(1, (os.cpu_count() or 4) // 2),
             "device": self.device_var.get(),
+            "fallback_focal": fallback_focal,
             "format": fmt,
+            "quality": quality,
+            "sh_degree": sh_degree,
             "sharp_exe": sharp_exe,
             "gsbox_exe": gsbox_exe,
             "transform": transform_values,
@@ -1535,6 +1683,9 @@ class App(tk.Tk):
 
     def _run_conversion_batch(self, selected_paths, settings):
         temp_root = tempfile.mkdtemp(prefix="easy_sharp_")
+        batch_started = time.perf_counter()
+        sharp_elapsed = 0.0
+        post_elapsed = 0.0
         try:
             self._set_status("Preparing temporary workspace...")
             raw_dir = os.path.join(temp_root, "raw_ply")
@@ -1544,17 +1695,30 @@ class App(tk.Tk):
             chunk_dirs = self._prepare_chunks(entries)
             self._configure_progress(len(chunk_dirs) + len(entries) + 2, f"Prepared {len(entries)} file(s)")
             self._advance_progress(1, "Input batch ready")
+            sharp_started = time.perf_counter()
             self._run_sharp_instances(chunk_dirs, raw_dir, settings)
+            sharp_elapsed = time.perf_counter() - sharp_started
+            post_started = time.perf_counter()
             self._postprocess_outputs(entries, raw_dir, settings, temp_root)
+            post_elapsed = time.perf_counter() - post_started
+            total_elapsed = time.perf_counter() - batch_started
+            avg_elapsed = total_elapsed / max(1, len(entries))
             self._set_status("Finished")
             self._complete_progress(f"Finished {len(entries)} of {len(entries)} files")
             self._log(f"Finished converting {len(entries)} files.", "ok")
+            self._log(
+                f"Performance: total={_format_duration(total_elapsed)}, average/file={_format_duration(avg_elapsed)}, "
+                f"SHARP={_format_duration(sharp_elapsed)}, post={_format_duration(post_elapsed)}",
+                "dim",
+            )
             preferred_directory = settings["output_folder"] if settings["output_mode"] == "custom" else self._current_dir
             self._refresh_file_browser(preferred_directory)
         except Exception as exc:
+            total_elapsed = time.perf_counter() - batch_started
             self._set_status("Failed")
             self._complete_progress("Batch failed")
             self._log(f"Conversion failed: {exc}", "err")
+            self._log(f"Performance until failure: total={_format_duration(total_elapsed)}", "dim")
             self._log(traceback.format_exc().rstrip(), "dim")
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
@@ -1567,7 +1731,8 @@ class App(tk.Tk):
             original_stem = os.path.splitext(os.path.basename(source_path))[0]
             stem_counts[original_stem] = stem_counts.get(original_stem, 0) + 1
             suffix = stem_counts[original_stem]
-            output_stem = original_stem if suffix == 1 else f"{original_stem}_{suffix}"
+            base_output_stem = original_stem if suffix == 1 else f"{original_stem}_{suffix}"
+            output_stem = f"{base_output_stem}_q{settings['quality']}_sh{settings['sh_degree']}"
             extension = os.path.splitext(source_path)[1].lower()
             temp_name = f"input_{index:04d}{extension}"
             temp_stem = os.path.splitext(temp_name)[0]
@@ -1580,6 +1745,7 @@ class App(tk.Tk):
                 "source_path": source_path,
                 "source_extension": extension,
                 "source_kind": "image" if extension in IMAGE_EXTENSIONS else "splat",
+                "fallback_focal": settings["fallback_focal"],
                 "output_dir": output_dir,
                 "output_stem": output_stem,
                 "temp_name": temp_name,
@@ -1591,17 +1757,22 @@ class App(tk.Tk):
 
     def _prepare_chunks(self, entries):
         chunk_dirs = {}
+        fallback_count = 0
         for entry in entries:
             if entry["source_kind"] != "image":
                 continue
             chunk_dir = entry["chunk_dir"]
             os.makedirs(chunk_dir, exist_ok=True)
-            shutil.copy2(entry["source_path"], os.path.join(chunk_dir, entry["temp_name"]))
+            destination = os.path.join(chunk_dir, entry["temp_name"])
+            if copy_image_with_fallback_focal(entry["source_path"], destination, entry["fallback_focal"]):
+                fallback_count += 1
             chunk_dirs[chunk_dir] = chunk_dirs.get(chunk_dir, 0) + 1
 
         image_count = sum(1 for entry in entries if entry["source_kind"] == "image")
         direct_count = len(entries) - image_count
         self._log(f"Prepared {image_count} image input(s) across {len(chunk_dirs)} SHARP chunk folders.", "dim")
+        if fallback_count:
+            self._log(f"Applied fallback focal length to {fallback_count} image(s) with missing EXIF focal data.", "dim")
         if direct_count:
             self._log(f"Prepared {direct_count} direct splat conversion(s) without SHARP.", "dim")
         for chunk_dir, count in sorted(chunk_dirs.items()):
@@ -1671,12 +1842,17 @@ class App(tk.Tk):
     def _export_single_entry(self, entry, raw_ply, settings, temp_root):
         work_dir = os.path.join(temp_root, f"work_{entry['index']:04d}")
         os.makedirs(work_dir, exist_ok=True)
+        process_temp_dir = os.path.join(work_dir, "tmp")
+        os.makedirs(process_temp_dir, exist_ok=True)
+        process_env = os.environ.copy()
+        process_env["TMP"] = process_temp_dir
+        process_env["TEMP"] = process_temp_dir
 
         current_ply = os.path.join(work_dir, "source.ply")
         if entry["source_kind"] == "image":
             clean_ply_file(raw_ply, current_ply)
         else:
-            convert_to_ply(entry["source_path"], current_ply, settings["gsbox_exe"])
+            convert_to_ply(entry["source_path"], current_ply, settings["gsbox_exe"], env=process_env, cwd=work_dir)
 
         transform_values = settings["transform"]
         if any(transform_values[key] is not None for key in ("trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z", "scale")):
@@ -1697,7 +1873,7 @@ class App(tk.Tk):
             if transform_values["scale"] is not None:
                 command.extend(["-s", str(transform_values["scale"])])
 
-            result = run_process(command)
+            result = run_process(command, env=process_env, cwd=work_dir)
             if result.returncode != 0:
                 raise RuntimeError((result.stderr or result.stdout or "gsbox transform failed").strip())
             current_ply = transformed_ply
@@ -1713,25 +1889,64 @@ class App(tk.Tk):
             os.remove(final_path)
 
         if fmt == "ply":
-            shutil.copy2(current_ply, final_path)
+            if settings["gsbox_exe"]:
+                command = [settings["gsbox_exe"], "ply2ply", "-i", current_ply, "-o", final_path, "-sh", str(settings["sh_degree"])]
+                result = run_process(command, env=process_env, cwd=work_dir)
+                if result.returncode != 0:
+                    raise RuntimeError((result.stderr or result.stdout or "gsbox ply2ply failed").strip())
+            else:
+                shutil.copy2(current_ply, final_path)
             return final_path
 
         if fmt == "spx":
-            command = [settings["gsbox_exe"], "ply2spx", "-i", current_ply, "-o", final_path]
-            result = run_process(command)
+            command = [
+                settings["gsbox_exe"],
+                "ply2spx",
+                "-i",
+                current_ply,
+                "-o",
+                final_path,
+                "-q",
+                str(settings["quality"]),
+                "-sh",
+                str(settings["sh_degree"]),
+            ]
+            result = run_process(command, env=process_env, cwd=work_dir)
             if result.returncode != 0:
                 raise RuntimeError((result.stderr or result.stdout or "gsbox ply2spx failed").strip())
             return final_path
 
         if fmt == "spz":
-            command = [settings["gsbox_exe"], "ply2spz", "-i", current_ply, "-o", final_path]
-            result = run_process(command)
+            command = [
+                settings["gsbox_exe"],
+                "ply2spz",
+                "-i",
+                current_ply,
+                "-o",
+                final_path,
+                "-q",
+                str(settings["quality"]),
+                "-sh",
+                str(settings["sh_degree"]),
+            ]
+            result = run_process(command, env=process_env, cwd=work_dir)
             if result.returncode != 0:
                 raise RuntimeError((result.stderr or result.stdout or "gsbox ply2spz failed").strip())
             return final_path
 
-        command = [settings["gsbox_exe"], "ply2sog", "-i", current_ply, "-o", final_path]
-        result = run_process(command)
+        command = [
+            settings["gsbox_exe"],
+            "ply2sog",
+            "-i",
+            current_ply,
+            "-o",
+            final_path,
+            "-q",
+            str(settings["quality"]),
+            "-sh",
+            str(settings["sh_degree"]),
+        ]
+        result = run_process(command, env=process_env, cwd=work_dir)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "gsbox ply2sog failed").strip())
         return final_path
