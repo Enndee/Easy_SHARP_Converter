@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 set "APP_NAME=Easy_SHARP_Converter"
-set "RELEASE_VERSION=1.5"
+set "RELEASE_VERSION=1.5.1"
 set "PACKAGE_DIR=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows"
 set "ZIP_PATH=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows.zip"
 set "VIEWER_SOURCE=splatapult\build\Release"

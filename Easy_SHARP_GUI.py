@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import traceback
+import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -65,6 +66,8 @@ TAGS_BY_NAME = {name: tag for tag, name in ExifTags.TAGS.items()}
 TAG_FOCAL = TAGS_BY_NAME.get("FocalLength")
 TAG_FOCAL_35 = TAGS_BY_NAME.get("FocalLengthIn35mmFilm")
 LANCZOS_FILTER = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+QUALITY_SUFFIX_RE = re.compile(r"^(?P<base>.+?)_q\d+_sh\d+$", re.IGNORECASE)
+TRAILING_INDEX_RE = re.compile(r"^(?P<base>.+)_(?P<index>\d+)$")
 
 
 def _creationflags():
@@ -377,6 +380,7 @@ class App(tk.Tk):
         self._thumb_futures = {}
         self._focal_cache = {}
         self._preview_image_by_stem = {}
+        self._image_lookup_cache = {}
         self._card_records = []
         self._selected_paths = []
         self._selectable_paths = []
@@ -815,7 +819,10 @@ class App(tk.Tk):
         self._button(nav_row, "Up", self._go_up, width=6).pack(side=tk.LEFT, padx=(8, 8))
         self.path_entry = self._entry(nav_row, self.path_var)
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.path_entry.bind("<Return>", self._open_from_entry)
+        self.path_entry.bind("<KP_Enter>", self._open_from_entry)
         self._button(nav_row, "Open", self._open_from_entry, width=8).pack(side=tk.LEFT, padx=(8, 0))
+        self._button(nav_row, "Explorer", self._open_in_explorer, width=9).pack(side=tk.LEFT, padx=(8, 0))
         self._button(nav_row, "Browse", self._browse_folder, width=8).pack(side=tk.LEFT, padx=(8, 0))
 
         hint_row = tk.Frame(parent, bg=BG3, padx=14, pady=10, highlightthickness=1, highlightbackground=CARD_BORDER)
@@ -1078,10 +1085,10 @@ class App(tk.Tk):
         if selected:
             self.splat_viewer_var.set(selected)
 
-    def _open_from_entry(self):
+    def _open_from_entry(self, _event=None):
         path = self.path_var.get().strip()
         if not path:
-            return
+            return "break"
         if os.path.isfile(path):
             self._open_directory(os.path.dirname(path))
             self.after(150, lambda: self._select_by_path(path))
@@ -1089,6 +1096,25 @@ class App(tk.Tk):
             self._open_directory(path)
         else:
             self._log(f"Path not found: {path}", "err")
+        return "break"
+
+    def _open_in_explorer(self):
+        target = self.path_var.get().strip() or self._current_dir or EXE_DIR
+        target = os.path.normpath(target)
+
+        if os.path.isfile(target):
+            command = ["explorer", f"/select,{target}"]
+        elif os.path.isdir(target):
+            command = ["explorer", target]
+        else:
+            self._log(f"Path not found: {target}", "err")
+            return
+
+        try:
+            subprocess.Popen(command, creationflags=_creationflags())
+            self._set_status(f"Opened {os.path.basename(target) or target} in Explorer")
+        except Exception as exc:
+            self._log(f"Explorer launch failed: {exc}", "err")
 
     def _go_up(self):
         if not self._current_dir:
@@ -1117,6 +1143,8 @@ class App(tk.Tk):
         self.browser_canvas.yview_moveto(0)
         self._selected_paths = []
         self._anchor_index = None
+        self._focal_cache = {}
+        self._image_lookup_cache = {}
 
         try:
             entries = list(os.scandir(directory))
@@ -1133,9 +1161,7 @@ class App(tk.Tk):
             (entry for entry in entries if entry.is_file() and os.path.splitext(entry.name)[1].lower() in SPLAT_EXTENSIONS),
             key=lambda item: item.name.lower(),
         )
-        self._preview_image_by_stem = {}
-        for entry in images:
-            self._preview_image_by_stem.setdefault(os.path.splitext(entry.name)[0].lower(), entry.path)
+        self._preview_image_by_stem = self._build_image_lookup(directory, images)
         self._browser_folders = folders
         self._browser_images = images
         self._browser_splats = splats
@@ -1418,9 +1444,76 @@ class App(tk.Tk):
         self._render_browser(self._browser_folders, self._browser_images, self._browser_splats)
         self._refresh_card_selection()
 
+    def _association_stems(self, stem):
+        keys = []
+        seen = set()
+
+        def add(value):
+            value = value.strip().lower()
+            if value and value not in seen:
+                seen.add(value)
+                keys.append(value)
+
+        add(stem)
+
+        quality_match = QUALITY_SUFFIX_RE.match(stem)
+        base_stem = quality_match.group("base") if quality_match else stem
+        add(base_stem)
+
+        trailing_match = TRAILING_INDEX_RE.match(base_stem)
+        if trailing_match:
+            add(trailing_match.group("base"))
+
+        return keys
+
+    def _build_image_lookup(self, directory, preloaded_entries=None):
+        lookup = {}
+        if preloaded_entries is None:
+            try:
+                preloaded_entries = sorted(
+                    (
+                        entry
+                        for entry in os.scandir(directory)
+                        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in IMAGE_EXTENSIONS
+                    ),
+                    key=lambda item: item.name.lower(),
+                )
+            except OSError:
+                preloaded_entries = []
+
+        for entry in preloaded_entries:
+            stem = os.path.splitext(entry.name)[0]
+            for key in self._association_stems(stem):
+                lookup.setdefault(key, entry.path)
+        return lookup
+
+    def _get_image_lookup(self, directory):
+        directory = os.path.normpath(directory)
+        cached = self._image_lookup_cache.get(directory)
+        if cached is not None:
+            return cached
+        lookup = self._preview_image_by_stem if self._current_dir and os.path.normpath(self._current_dir) == directory else self._build_image_lookup(directory)
+        self._image_lookup_cache[directory] = lookup
+        return lookup
+
     def _find_matching_image(self, file_path):
         stem = os.path.splitext(os.path.basename(file_path))[0].lower()
-        return self._preview_image_by_stem.get(stem)
+        keys = self._association_stems(stem)
+        search_dir = os.path.dirname(file_path)
+
+        for _depth in range(3):
+            lookup = self._get_image_lookup(search_dir)
+            for key in keys:
+                match = lookup.get(key)
+                if match:
+                    return match
+
+            parent = os.path.dirname(search_dir)
+            if not parent or parent == search_dir:
+                break
+            search_dir = parent
+
+        return None
 
     def _queue_thumbnail(self, item_path, preview_path, label_widget, background_color):
         cache_key = ("preview", preview_path, background_color)
