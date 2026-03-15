@@ -125,7 +125,8 @@ def _default_settings():
         "device": "cuda",
         "fallback_focal": "",
         "format": "ply",
-        "quality": 5,
+        "quality": 9,
+        "append_quality_suffix": False,
         "sh_degree": 0,
         "trans_x": "",
         "trans_y": "",
@@ -402,7 +403,8 @@ class App(tk.Tk):
         self.workers_var = tk.IntVar(value=max(1, int(self._settings.get("workers", 2))))
         self.fallback_focal_var = tk.StringVar(value=self._settings.get("fallback_focal", ""))
         self.format_var = tk.StringVar(value=self._settings.get("format", "ply"))
-        self.quality_var = tk.IntVar(value=min(9, max(1, int(self._settings.get("quality", 5)))))
+        self.quality_var = tk.IntVar(value=min(9, max(1, int(self._settings.get("quality", 9)))))
+        self.append_quality_suffix_var = tk.BooleanVar(value=bool(self._settings.get("append_quality_suffix", False)))
         self.sh_degree_var = tk.IntVar(value=min(3, max(0, int(self._settings.get("sh_degree", 0)))))
         self.path_var = tk.StringVar(value=self._settings.get("last_browse_folder", EXE_DIR))
         self.gsbox_var = tk.StringVar(value=self._settings.get("gsbox_path", ""))
@@ -514,6 +516,7 @@ class App(tk.Tk):
             "fallback_focal": self.fallback_focal_var,
             "format": self.format_var,
             "quality": self.quality_var,
+            "append_quality_suffix": self.append_quality_suffix_var,
             "sh_degree": self.sh_degree_var,
             "gsbox_path": self.gsbox_var,
             "splat_viewer_path": self.splat_viewer_var,
@@ -664,7 +667,7 @@ class App(tk.Tk):
 
         quality_group = tk.Frame(export_options_row, bg=BG2)
         quality_group.pack(side=tk.LEFT, padx=(0, 18))
-        tk.Label(quality_group, text="Quality (1-9, default 5)", bg=BG2, fg=FG, font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Label(quality_group, text="Quality (1-9, default 9)", bg=BG2, fg=FG, font=("Segoe UI", 10)).pack(anchor="w")
         tk.Spinbox(
             quality_group,
             from_=1,
@@ -678,6 +681,11 @@ class App(tk.Tk):
             relief=tk.FLAT,
             buttonbackground=BG4,
         ).pack(anchor="w", pady=(4, 0))
+        self._checkbutton(
+            quality_group,
+            "Append q/sh to filename",
+            self.append_quality_suffix_var,
+        ).pack(anchor="w", pady=(6, 0))
 
         sh_group = tk.Frame(export_options_row, bg=BG2)
         sh_group.pack(side=tk.LEFT)
@@ -1765,6 +1773,7 @@ class App(tk.Tk):
             "fallback_focal": fallback_focal,
             "format": fmt,
             "quality": quality,
+            "append_quality_suffix": self.append_quality_suffix_var.get(),
             "sh_degree": sh_degree,
             "sharp_exe": sharp_exe,
             "gsbox_exe": gsbox_exe,
@@ -1825,7 +1834,9 @@ class App(tk.Tk):
             stem_counts[original_stem] = stem_counts.get(original_stem, 0) + 1
             suffix = stem_counts[original_stem]
             base_output_stem = original_stem if suffix == 1 else f"{original_stem}_{suffix}"
-            output_stem = f"{base_output_stem}_q{settings['quality']}_sh{settings['sh_degree']}"
+            output_stem = base_output_stem
+            if settings["append_quality_suffix"]:
+                output_stem = f"{base_output_stem}_q{settings['quality']}_sh{settings['sh_degree']}"
             extension = os.path.splitext(source_path)[1].lower()
             temp_name = f"input_{index:04d}{extension}"
             temp_stem = os.path.splitext(temp_name)[0]
