@@ -20,6 +20,8 @@ import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from pathlib import Path
+
 from PIL import Image, ImageDraw, ImageOps, ImageTk, ExifTags, TiffImagePlugin
 from plyfile import PlyData, PlyElement
 
@@ -365,6 +367,344 @@ def run_process(command, *, shell=False, env=None, cwd=None):
     )
 
 
+class _SHARPEngine:
+    """In-process SHARP inference engine.
+
+    Loads the model once and reuses it across all images in a batch,
+    eliminating per-subprocess model-loading overhead.  Mirrors SPAG4d's
+    approach: eager mode + torch.inference_mode + full-res warmup + TF32.
+    """
+
+    _INTERNAL_SIZE = (1536, 1536)
+
+    def __init__(self, device="cuda", log_fn=None):
+        import torch
+        from sharp.models import create_predictor, PredictorParams
+        from sharp.cli.predict import DEFAULT_MODEL_URL
+
+        self._log = log_fn or (lambda msg, tag=None: None)
+        self._torch = torch
+        self.device = torch.device(device)
+
+        # Enable hardware-accelerated math (Ampere+ GPUs)
+        if device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        self._log("Loading SHARP model (one-time)...", "dim")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            state_dict = torch.hub.load_state_dict_from_url(
+                DEFAULT_MODEL_URL, progress=True
+            )
+        self.predictor = create_predictor(PredictorParams())
+        self.predictor.load_state_dict(state_dict)
+        self.predictor.eval()
+        self.predictor.to(self.device)
+
+        # Full-resolution warmup — primes ALL CUDA kernels (SPN patches,
+        # DINOv2 attention, decoder convolutions) at the actual 1536×1536
+        # inference size.  Subsequent calls reuse cached kernels.
+        if device == "cuda":
+            self._warmup(torch)
+
+        self._log("SHARP model ready.", "ok")
+
+    def _warmup(self, torch):
+        """Run one full-size forward pass to prime CUDA kernels."""
+        self._log("Warmup: priming CUDA kernels at 1536×1536 (one-time)...", "dim")
+        dummy_img = torch.randn(1, 3, 1536, 1536, device=self.device)
+        dummy_df = torch.tensor([1.0], device=self.device)
+        with torch.inference_mode():
+            self.predictor(dummy_img, dummy_df)
+        torch.cuda.synchronize()
+        self._log("Warmup complete — CUDA kernels cached.", "dim")
+
+    # ------------------------------------------------------------------
+    # Preload helpers  (run on a background thread)
+    # ------------------------------------------------------------------
+    def _preload_image(self, image_path, fallback_focal_mm):
+        """Load and preprocess an image on CPU (thread-safe).
+
+        Returns CPU tensors; the caller moves them to GPU in the main thread.
+        """
+        import torch
+        import torch.nn.functional as F
+        from sharp.utils.io import load_rgb, convert_focallength
+
+        image, _, f_px = load_rgb(Path(image_path))
+        height, width = image.shape[:2]
+
+        if fallback_focal_mm is not None:
+            has_exif_focal = extract_focal_length(str(image_path)) is not None
+            if not has_exif_focal:
+                f_px = convert_focallength(width, height, fallback_focal_mm)
+
+        sz = self._INTERNAL_SIZE
+        image_pt = (
+            torch.from_numpy(image).float().permute(2, 0, 1) / 255.0
+        )
+        image_resized = F.interpolate(
+            image_pt[None], size=(sz[1], sz[0]),
+            mode="bilinear", align_corners=True,
+        )
+        disparity_factor = torch.tensor([f_px / width]).float()
+        return image_resized, disparity_factor, f_px, height, width
+
+    # ------------------------------------------------------------------
+    # Fast PLY writer  (avoids slow list-of-tuples conversion)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _save_ply_fast(gaussians, f_px, height, width, out_path):
+        """Write Gaussian PLY ~5x faster than the upstream save_ply."""
+        import torch
+        import numpy as np
+        from sharp.utils import color_space as cs_utils
+        from sharp.utils.gaussians import convert_rgb_to_spherical_harmonics
+        from plyfile import PlyData, PlyElement
+
+        with torch.inference_mode():
+            xyz = gaussians.mean_vectors.flatten(0, 1)
+            scale_logits = torch.log(gaussians.singular_values).flatten(0, 1)
+            quaternions = gaussians.quaternions.flatten(0, 1)
+            colors = convert_rgb_to_spherical_harmonics(
+                cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1))
+            )
+            opacity_logits = torch.log(
+                gaussians.opacities / (1.0 - gaussians.opacities)
+            ).flatten(0, 1).unsqueeze(-1)
+
+            attrs = torch.cat(
+                (xyz, colors, opacity_logits, scale_logits, quaternions), dim=1,
+            )
+
+        arr = attrs.detach().cpu().numpy()
+        names = (
+            ["x", "y", "z"]
+            + [f"f_dc_{i}" for i in range(3)]
+            + ["opacity"]
+            + [f"scale_{i}" for i in range(3)]
+            + [f"rot_{i}" for i in range(4)]
+        )
+        dtype_full = [(n, "f4") for n in names]
+        elements = np.empty(len(arr), dtype=dtype_full)
+        for i, n in enumerate(names):
+            elements[n] = arr[:, i]
+        vertex_el = PlyElement.describe(elements, "vertex")
+
+        # Metadata elements (same as upstream save_ply)
+        image_size_el = PlyElement.describe(
+            np.array([(width,), (height,)], dtype=[("image_size", "u4")]),
+            "image_size",
+        )
+        intrinsic_vals = np.array(
+            [f_px, 0, width * 0.5, 0, f_px, height * 0.5, 0, 0, 1], dtype=np.float32
+        )
+        intrinsic_el = PlyElement.describe(
+            np.array([(v,) for v in intrinsic_vals], dtype=[("intrinsic", "f4")]),
+            "intrinsic",
+        )
+        extrinsic_el = PlyElement.describe(
+            np.array(
+                [(v,) for v in np.eye(4, dtype=np.float32).ravel()],
+                dtype=[("extrinsic", "f4")],
+            ),
+            "extrinsic",
+        )
+        frame_el = PlyElement.describe(
+            np.array([(1,), (len(arr),)], dtype=[("frame", "i4")]),
+            "frame",
+        )
+
+        with torch.inference_mode():
+            disparity = 1.0 / gaussians.mean_vectors[0, ..., -1]
+            q = torch.quantile(
+                disparity,
+                q=torch.tensor([0.1, 0.9], device=disparity.device),
+            ).float().cpu().numpy()
+        disparity_el = PlyElement.describe(
+            np.array([(v,) for v in q], dtype=[("disparity", "f4")]),
+            "disparity",
+        )
+        cs_idx = cs_utils.encode_color_space("sRGB")
+        color_space_el = PlyElement.describe(
+            np.array([(cs_idx,)], dtype=[("color_space", "u1")]),
+            "color_space",
+        )
+        version_el = PlyElement.describe(
+            np.array([(1,), (5,), (0,)], dtype=[("version", "u1")]),
+            "version",
+        )
+
+        PlyData(
+            [vertex_el, extrinsic_el, intrinsic_el, image_size_el,
+             frame_el, disparity_el, color_space_el, version_el]
+        ).write(str(out_path))
+
+    # ------------------------------------------------------------------
+    # GPU-only unprojection (replaces Apple's CPU SVD bottleneck)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rotmat_to_quat(R):
+        """Batch rotation matrices → quaternions (wxyz). Pure torch, stays on GPU.
+
+        Uses Shepperd's method with branchless selection.
+        R: [*, 3, 3] → [*, 4]
+        """
+        import torch
+        orig_shape = R.shape[:-2]
+        R = R.reshape(-1, 3, 3)
+        m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+        m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+        m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+        trace = m00 + m11 + m22
+
+        s0 = (trace + 1.0).clamp(min=1e-10).sqrt() * 2.0
+        s1 = (1.0 + m00 - m11 - m22).clamp(min=1e-10).sqrt() * 2.0
+        s2 = (1.0 + m11 - m00 - m22).clamp(min=1e-10).sqrt() * 2.0
+        s3 = (1.0 + m22 - m00 - m11).clamp(min=1e-10).sqrt() * 2.0
+
+        q0 = torch.stack([0.25*s0, (m21-m12)/s0, (m02-m20)/s0, (m10-m01)/s0], -1)
+        q1 = torch.stack([(m21-m12)/s1, 0.25*s1, (m01+m10)/s1, (m02+m20)/s1], -1)
+        q2 = torch.stack([(m02-m20)/s2, (m01+m10)/s2, 0.25*s2, (m12+m21)/s2], -1)
+        q3 = torch.stack([(m10-m01)/s3, (m02+m20)/s3, (m12+m21)/s3, 0.25*s3], -1)
+
+        all_q = torch.stack([q0, q1, q2, q3], dim=1)  # [N, 4, 4]
+        best = torch.stack([trace, m00, m11, m22], -1).argmax(-1)
+        idx = best[:, None, None].expand(-1, 1, 4)
+        q = all_q.gather(1, idx).squeeze(1)
+        q = q / q.norm(dim=-1, keepdim=True)
+        return q.reshape(orig_shape + (4,))
+
+    @staticmethod
+    def _unproject_gpu(gaussians_ndc, extrinsics, intrinsics, image_shape):
+        """GPU-only Gaussian unprojection (no CPU SVD, no scipy)."""
+        import torch
+        from sharp.utils.gaussians import (
+            Gaussians3D, get_unprojection_matrix, compose_covariance_matrices,
+        )
+        T_full = get_unprojection_matrix(extrinsics, intrinsics, image_shape)
+        T_lin = T_full[:3, :3]  # [3, 3]
+        T_off = T_full[:3, 3]   # [3]
+
+        means = gaussians_ndc.mean_vectors @ T_lin.T + T_off
+        cov = compose_covariance_matrices(
+            gaussians_ndc.quaternions, gaussians_ndc.singular_values,
+        )
+        cov = T_lin @ cov @ T_lin.transpose(-1, -2)
+
+        U, S2, _ = torch.linalg.svd(cov)
+        # Fix reflections from SVD
+        neg = torch.linalg.det(U) < 0
+        if neg.any():
+            U[neg, :, -1] *= -1
+
+        quats = _SHARPEngine._rotmat_to_quat(U)
+        return Gaussians3D(
+            mean_vectors=means,
+            singular_values=S2.sqrt(),
+            quaternions=quats,
+            colors=gaussians_ndc.colors,
+            opacities=gaussians_ndc.opacities,
+        )
+
+    # ------------------------------------------------------------------
+    # Core predict  (GPU only — no disk I/O)
+    # ------------------------------------------------------------------
+    def _predict_gpu(self, image_resized, disparity_factor, f_px, height, width):
+        """Run the SHARP model and unproject, returning Gaussians3D on GPU."""
+        import torch
+
+        dev = self.device
+        image_resized = image_resized.to(dev)
+        disparity_factor = disparity_factor.to(dev)
+        sz = self._INTERNAL_SIZE
+
+        with torch.inference_mode():
+            gaussians_ndc = self.predictor(image_resized, disparity_factor)
+
+            intrinsics = torch.tensor(
+                [[f_px, 0, width / 2, 0],
+                 [0, f_px, height / 2, 0],
+                 [0, 0, 1, 0],
+                 [0, 0, 0, 1]],
+            ).float().to(dev)
+            intrinsics_resized = intrinsics.clone()
+            intrinsics_resized[0] *= sz[0] / width
+            intrinsics_resized[1] *= sz[1] / height
+
+            gaussians = self._unproject_gpu(
+                gaussians_ndc, torch.eye(4, device=dev),
+                intrinsics_resized, sz,
+            )
+        return gaussians
+
+    # ------------------------------------------------------------------
+    # Batched forward pass  (process N images in one predictor call)
+    # ------------------------------------------------------------------
+    def _forward_batch(self, images_cat, disparities_cat):
+        """Run predictor on a batch [B,3,H,W] → batched Gaussians3D."""
+        import torch
+
+        dev = self.device
+        images_cat = images_cat.to(dev)
+        disparities_cat = disparities_cat.to(dev)
+
+        with torch.inference_mode():
+            return self.predictor(images_cat, disparities_cat)
+
+    def _unproject_single(self, gaussians_ndc_batch, index, f_px, height, width):
+        """Slice one image out of a batched Gaussians3D and unproject it."""
+        import torch
+        from sharp.utils.gaussians import Gaussians3D
+
+        dev = self.device
+        sz = self._INTERNAL_SIZE
+        g = Gaussians3D(
+            mean_vectors=gaussians_ndc_batch.mean_vectors[index : index + 1],
+            singular_values=gaussians_ndc_batch.singular_values[index : index + 1],
+            quaternions=gaussians_ndc_batch.quaternions[index : index + 1],
+            colors=gaussians_ndc_batch.colors[index : index + 1],
+            opacities=gaussians_ndc_batch.opacities[index : index + 1],
+        )
+        with torch.inference_mode():
+            intrinsics = torch.tensor(
+                [[f_px, 0, width / 2, 0],
+                 [0, f_px, height / 2, 0],
+                 [0, 0, 1, 0],
+                 [0, 0, 0, 1]],
+            ).float().to(dev)
+            intrinsics_resized = intrinsics.clone()
+            intrinsics_resized[0] *= sz[0] / width
+            intrinsics_resized[1] *= sz[1] / height
+            return self._unproject_gpu(
+                g, torch.eye(4, device=dev), intrinsics_resized, sz,
+            )
+
+    # ------------------------------------------------------------------
+    # Public API — single image
+    # ------------------------------------------------------------------
+    def predict_to_ply(self, image_path, output_ply_path, fallback_focal_mm=None):
+        """Run SHARP on *image_path*, write Gaussian PLY to *output_ply_path*."""
+        img_data = self._preload_image(image_path, fallback_focal_mm)
+        image_resized, disparity_factor, f_px, height, width = img_data
+
+        gaussians = self._predict_gpu(image_resized, disparity_factor, f_px, height, width)
+
+        out = Path(output_ply_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        self._save_ply_fast(gaussians, f_px, height, width, out)
+
+    def release(self):
+        """Free GPU memory."""
+        if hasattr(self, "predictor"):
+            del self.predictor
+        if self._torch.cuda.is_available():
+            self._torch.cuda.empty_cache()
+
+
 class App(tk.Tk):
     def __init__(self, initial_target=""):
         super().__init__()
@@ -387,6 +727,8 @@ class App(tk.Tk):
         self._selectable_paths = []
         self._anchor_index = None
         self._hovered_path = None
+        self._hover_leave_after_id = None
+        self._card_by_path = {}
         self._browser_folders = []
         self._browser_images = []
         self._browser_splats = []
@@ -1260,10 +1602,7 @@ class App(tk.Tk):
             self._refresh_card_selection()
             self._update_selection_ui()
 
-        if record["kind"] == "image":
-            self._open_with_default_viewer(record["path"])
-        else:
-            self._launch_with_viewer(record["path"])
+        self._open_with_default_viewer(record["path"])
         return "break"
 
     def _on_browser_resize(self, event):
@@ -1279,15 +1618,44 @@ class App(tk.Tk):
         self.left_canvas.itemconfigure(self.left_window, width=event.width)
 
     def _set_card_hover(self, path):
+        if self._hover_leave_after_id is not None:
+            self.after_cancel(self._hover_leave_after_id)
+            self._hover_leave_after_id = None
         if self._hovered_path == path:
             return
+        old_hovered = self._hovered_path
         self._hovered_path = path
-        self._refresh_card_selection()
+        self._update_single_card_style(old_hovered)
+        self._update_single_card_style(path)
 
     def _clear_card_hover(self, path):
+        if self._hovered_path != path:
+            return
+        if self._hover_leave_after_id is not None:
+            self.after_cancel(self._hover_leave_after_id)
+        self._hover_leave_after_id = self.after(15, self._do_clear_hover, path)
+
+    def _do_clear_hover(self, path):
+        self._hover_leave_after_id = None
         if self._hovered_path == path:
             self._hovered_path = None
-            self._refresh_card_selection()
+            self._update_single_card_style(path)
+
+    def _update_single_card_style(self, path):
+        if path is None:
+            return
+        record = self._card_by_path.get(path)
+        if record is None:
+            return
+        active = record["path"] in set(self._selected_paths) and record["kind"] != "folder"
+        hovered = record["path"] == self._hovered_path
+        bg = CARD_SELECTED if active else CARD_HOVER if hovered else CARD_BG
+        border = ACCENT if active else ACCENT_DIM if hovered else CARD_BORDER
+        record["frame"].configure(bg=bg, highlightbackground=border)
+        record["thumb"].configure(bg=record["thumb_bg"])
+        record["name"].configure(bg=bg, fg=FG)
+        record["meta"].configure(bg=bg, fg=FG_DIM)
+        record["size"].configure(bg=bg, fg=FG_DIM)
 
     def _on_mousewheel(self, event):
         widget = self.winfo_containing(event.x_root, event.y_root)
@@ -1361,6 +1729,7 @@ class App(tk.Tk):
             child.destroy()
 
         self._card_records = []
+        self._card_by_path = {}
         self._selectable_paths = [entry.path for entry in images]
         self._selectable_paths.extend(entry.path for entry in splats)
         items = [("folder", entry.path, entry.name) for entry in folders]
@@ -1386,8 +1755,9 @@ class App(tk.Tk):
                 highlightbackground=CARD_BORDER,
                 cursor="hand2",
             )
-            frame.grid(row=row, column=column, padx=6, pady=6, sticky="nsew")
+            frame.grid(row=row, column=column, padx=6, pady=6, sticky="n")
             frame.grid_propagate(False)
+            frame.pack_propagate(False)
 
             thumb_bg = CARD_BG
             if kind == "image":
@@ -1395,10 +1765,10 @@ class App(tk.Tk):
             elif kind == "splat":
                 thumb_bg = SPLAT_PREVIEW_BG
 
-            thumb_holder = tk.Label(frame, bg=thumb_bg, image=self._placeholder_photo)
+            thumb_holder = tk.Label(frame, bg=thumb_bg, image=self._placeholder_photo, width=THUMB_SIZE[0], height=THUMB_SIZE[1])
             thumb_holder.image = self._placeholder_photo
-            thumb_holder.pack(pady=(10, 8))
-            name_label = tk.Label(frame, text=name, bg=CARD_BG, fg=FG, wraplength=CARD_WIDTH - 24, justify="center", font=("Segoe UI", 9))
+            thumb_holder.pack(pady=(10, 4))
+            name_label = tk.Label(frame, text=name, bg=CARD_BG, fg=FG, wraplength=CARD_WIDTH - 24, justify="center", font=("Segoe UI", 9), height=2)
             name_label.pack(fill=tk.X, padx=8)
             meta_text = "Open folder" if kind == "folder" else ""
             meta_label = tk.Label(frame, text=meta_text, bg=CARD_BG, fg=FG_DIM, font=("Segoe UI", 8))
@@ -1417,12 +1787,13 @@ class App(tk.Tk):
                 "size": size_label,
             }
             self._card_records.append(record)
+            self._card_by_path[path] = record
 
             for widget in (frame, thumb_holder, name_label, meta_label, size_label):
                 widget.bind("<Button-1>", lambda event, rec=record: self._on_card_click(event, rec))
                 widget.bind("<Double-Button-1>", lambda event, rec=record: self._on_card_double_click(event, rec))
-            frame.bind("<Enter>", lambda _event, item_path=path: self._set_card_hover(item_path))
-            frame.bind("<Leave>", lambda _event, item_path=path: self._clear_card_hover(item_path))
+                widget.bind("<Enter>", lambda _event, item_path=path: self._set_card_hover(item_path))
+                widget.bind("<Leave>", lambda _event, item_path=path: self._clear_card_hover(item_path))
 
             if kind == "folder":
                 thumb_holder.configure(image=self._folder_photo)
@@ -1444,7 +1815,7 @@ class App(tk.Tk):
                 size_label.configure(text=_format_mb(path))
 
         for column in range(columns):
-            self.browser_inner.grid_columnconfigure(column, weight=1)
+            self.browser_inner.grid_columnconfigure(column, weight=1, minsize=CARD_WIDTH)
 
     def _rerender_cards(self):
         if not self._current_dir:
@@ -1788,18 +2159,39 @@ class App(tk.Tk):
         batch_started = time.perf_counter()
         sharp_elapsed = 0.0
         post_elapsed = 0.0
+        sharp_engine = None
         try:
             self._set_status("Preparing temporary workspace...")
             raw_dir = os.path.join(temp_root, "raw_ply")
             os.makedirs(raw_dir, exist_ok=True)
 
             entries = self._build_processing_entries(selected_paths, settings, temp_root)
-            chunk_dirs = self._prepare_chunks(entries)
-            self._configure_progress(len(chunk_dirs) + len(entries) + 2, f"Prepared {len(entries)} file(s)")
-            self._advance_progress(1, "Input batch ready")
-            sharp_started = time.perf_counter()
-            self._run_sharp_instances(chunk_dirs, raw_dir, settings)
-            sharp_elapsed = time.perf_counter() - sharp_started
+            has_images = any(e["source_kind"] == "image" for e in entries)
+            use_direct = False
+
+            if has_images:
+                try:
+                    sharp_engine = _SHARPEngine(settings["device"], log_fn=self._log)
+                    use_direct = True
+                except Exception as exc:
+                    self._log(f"Direct SHARP API unavailable ({exc}). Using subprocess fallback.", "warn")
+                    sharp_engine = None
+
+            if use_direct:
+                image_entries = [e for e in entries if e["source_kind"] == "image"]
+                self._configure_progress(len(image_entries) + len(entries) + 2, f"Prepared {len(entries)} file(s)")
+                self._advance_progress(1, "Input batch ready")
+                sharp_started = time.perf_counter()
+                self._run_sharp_direct(image_entries, raw_dir, sharp_engine, settings)
+                sharp_elapsed = time.perf_counter() - sharp_started
+            else:
+                chunk_dirs = self._prepare_chunks(entries)
+                self._configure_progress(len(chunk_dirs) + len(entries) + 2, f"Prepared {len(entries)} file(s)")
+                self._advance_progress(1, "Input batch ready")
+                sharp_started = time.perf_counter()
+                self._run_sharp_instances(chunk_dirs, raw_dir, settings)
+                sharp_elapsed = time.perf_counter() - sharp_started
+
             post_started = time.perf_counter()
             self._postprocess_outputs(entries, raw_dir, settings, temp_root)
             post_elapsed = time.perf_counter() - post_started
@@ -1808,8 +2200,9 @@ class App(tk.Tk):
             self._set_status("Finished")
             self._complete_progress(f"Finished {len(entries)} of {len(entries)} files")
             self._log(f"Finished converting {len(entries)} files.", "ok")
+            mode_tag = "direct" if use_direct else "subprocess"
             self._log(
-                f"Performance: total={_format_duration(total_elapsed)}, average/file={_format_duration(avg_elapsed)}, "
+                f"Performance ({mode_tag}): total={_format_duration(total_elapsed)}, average/file={_format_duration(avg_elapsed)}, "
                 f"SHARP={_format_duration(sharp_elapsed)}, post={_format_duration(post_elapsed)}",
                 "dim",
             )
@@ -1823,6 +2216,8 @@ class App(tk.Tk):
             self._log(f"Performance until failure: total={_format_duration(total_elapsed)}", "dim")
             self._log(traceback.format_exc().rstrip(), "dim")
         finally:
+            if sharp_engine is not None:
+                sharp_engine.release()
             shutil.rmtree(temp_root, ignore_errors=True)
             self._set_running(False)
 
@@ -1883,12 +2278,132 @@ class App(tk.Tk):
             self._log(f"  {os.path.basename(chunk_dir)}: {count} image(s)", "dim")
         return [chunk_dir for chunk_dir, count in chunk_dirs.items() if count > 0]
 
+    def _run_sharp_direct(self, image_entries, raw_dir, engine, settings):
+        """Run SHARP inference in-process with batched forward passes.
+
+        Images are grouped into batches (size = workers setting).  Each batch:
+        1. Preloads all images in parallel on background threads.
+        2. Runs a single batched forward pass through the model.
+        3. Unprojjects + writes each PLY in parallel on background threads.
+
+        If a batch causes an OOM, the batch size is halved automatically.
+        """
+        import torch
+
+        if not image_entries:
+            return
+        n = len(image_entries)
+        batch_size = min(max(1, settings.get("workers", 2)), n)
+        fallback = settings.get("fallback_focal")
+
+        self._set_status("Running SHARP predictions (direct)...")
+        self._log(
+            f"Processing {n} image(s) in batches of {batch_size} on {settings['device']}.",
+            "dim",
+        )
+
+        io_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(batch_size, 2),
+        )
+        # Pre-submit preloads for the first batch
+        first_end = min(batch_size, n)
+        preload_futures = [
+            io_pool.submit(engine._preload_image, image_entries[i]["source_path"], fallback)
+            for i in range(first_end)
+        ]
+        save_futures = []   # outstanding PLY writes
+
+        idx = 0
+        while idx < n:
+            batch_end = min(idx + batch_size, n)
+            batch_entries = image_entries[idx:batch_end]
+            actual_bs = len(batch_entries)
+            t0 = time.perf_counter()
+
+            # Collect preloaded data for this batch
+            preloaded = [f.result() for f in preload_futures[:actual_bs]]
+            preload_futures = preload_futures[actual_bs:]
+
+            # Kick off preloads for the NEXT batch while GPU runs
+            next_end = min(batch_end + batch_size, n)
+            for j in range(batch_end, next_end):
+                preload_futures.append(
+                    io_pool.submit(
+                        engine._preload_image,
+                        image_entries[j]["source_path"],
+                        fallback,
+                    )
+                )
+
+            # Stack into batched tensors
+            images_cat = torch.cat([p[0] for p in preloaded], dim=0)
+            disparities_cat = torch.cat([p[1] for p in preloaded], dim=0)
+
+            # Batched forward pass (with OOM fallback)
+            try:
+                gaussians_ndc = engine._forward_batch(images_cat, disparities_cat)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if batch_size > 1:
+                    batch_size = max(1, batch_size // 2)
+                    self._log(
+                        f"OOM — reducing batch size to {batch_size}. Retrying.",
+                        "warn",
+                    )
+                    # Re-queue everything for this batch as individual preloads
+                    new_futures = [
+                        io_pool.submit(
+                            engine._preload_image, e["source_path"], fallback,
+                        )
+                        for e in image_entries[idx:next_end]
+                    ]
+                    preload_futures = new_futures
+                    continue  # retry from same idx with smaller batch
+                raise  # batch_size already 1, nothing left to try
+
+            # Wait for any outstanding PLY writes before starting new ones
+            for f in save_futures:
+                f.result()
+            save_futures.clear()
+
+            # Per-image: unproject + save PLY (parallel on thread pool)
+            for i, (entry, pdata) in enumerate(zip(batch_entries, preloaded)):
+                _, _, f_px, height, width = pdata
+                gaussians_i = engine._unproject_single(
+                    gaussians_ndc, i, f_px, height, width,
+                )
+                out_ply = Path(os.path.join(raw_dir, f"{entry['temp_stem']}.ply"))
+                save_futures.append(
+                    io_pool.submit(
+                        engine._save_ply_fast,
+                        gaussians_i, f_px, height, width, out_ply,
+                    )
+                )
+
+            elapsed = time.perf_counter() - t0
+            for entry in batch_entries:
+                name = os.path.basename(entry["source_path"])
+                self._advance_progress(1, f"SHARP: {name}")
+            avg = elapsed / actual_bs
+            names = ", ".join(os.path.basename(e["source_path"]) for e in batch_entries)
+            self._log(
+                f"Batch of {actual_bs} done ({_format_duration(elapsed)}, "
+                f"{_format_duration(avg)}/img): {names}",
+                "ok",
+            )
+            idx = batch_end
+
+        # Wait for final PLY writes
+        for f in save_futures:
+            f.result()
+        io_pool.shutdown(wait=False)
+
     def _run_sharp_instances(self, chunk_dirs, raw_dir, settings):
         if not chunk_dirs:
             self._log("No image inputs selected. Skipping SHARP stage.", "dim")
             return
 
-        self._set_status("Running SHARP predictions...")
+        self._set_status("Running SHARP predictions (subprocess)...")
         self._log(f"Running {len(chunk_dirs)} SHARP instance(s) with device={settings['device']}.", "dim")
 
         def run_chunk(chunk_dir):
