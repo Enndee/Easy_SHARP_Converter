@@ -1,0 +1,2 @@
+Parallelize SHARP and Export
+Mirror every input picture

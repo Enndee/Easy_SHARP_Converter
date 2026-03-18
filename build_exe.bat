@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 set "APP_NAME=Easy_SHARP_Converter"
-set "RELEASE_VERSION=1.5.2"
+set "RELEASE_VERSION=1.5.3"
 set "PACKAGE_DIR=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows"
 set "ZIP_PATH=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows.zip"
 set "VIEWER_SOURCE=splatapult\build\Release"
@@ -132,13 +132,13 @@ REM Write a quick README
     echo   2. Anaconda or Miniconda - https://www.anaconda.com/download
     echo   3. Git for Windows      - https://git-scm.com/download/win
     echo.
-    echo SETUP (first time only^)
+    echo SETUP ^(first time only^)
     echo   Run Setup_NewPC.bat  -- installs the SHARP conda environment.
     echo.
     echo USAGE
     echo   - Double-click Easy_SHARP_Converter.exe and use the file picker, OR
     echo   - Right-click any JPEG/PNG -^> Send To -^> Easy SHARP Converter
-    echo     (Setup_NewPC.bat creates the Send To shortcut automatically^)
+    echo     ^(Setup_NewPC.bat creates the Send To shortcut automatically^)
     echo   - Double-click splat files in the GUI to open them in the configured viewer
     echo.
     echo FOLDER STRUCTURE

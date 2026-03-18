@@ -759,6 +759,7 @@ class App(tk.Tk):
         self.output_folder_var = tk.StringVar(value=self._settings.get("output_folder", ""))
         self.device_var = tk.StringVar(value=self._settings.get("device", "cuda"))
         self.workers_var = tk.IntVar(value=max(1, int(self._settings.get("workers", 2))))
+        self._workers_warning_shown = self.workers_var.get() > 1
         self.fallback_focal_var = tk.StringVar(value=self._settings.get("fallback_focal", ""))
         self.format_var = tk.StringVar(value=self._settings.get("format", "ply"))
         self.quality_var = tk.IntVar(value=min(9, max(1, int(self._settings.get("quality", 9)))))
@@ -882,7 +883,7 @@ class App(tk.Tk):
         for key, var in tracked.items():
             var.trace_add("write", lambda *_args, setting_key=key, setting_var=var: save_settings({setting_key: setting_var.get()}))
 
-        self.workers_var.trace_add("write", lambda *_: save_settings({"workers": self.workers_var.get()}))
+        self.workers_var.trace_add("write", lambda *_: self._on_workers_changed())
         self.path_var.trace_add("write", lambda *_: save_settings({"last_browse_folder": self.path_var.get()}))
 
         for key, var in self.transform_vars.items():
@@ -891,6 +892,26 @@ class App(tk.Tk):
             var.trace_add("write", lambda *_args, setting_key=key, setting_var=var: save_settings({setting_key: setting_var.get()}))
 
         self.output_mode_var.trace_add("write", lambda *_: self._sync_output_mode())
+
+    def _on_workers_changed(self):
+        try:
+            workers = max(1, int(self.workers_var.get()))
+        except Exception:
+            return
+
+        save_settings({"workers": workers})
+        if workers <= 1:
+            self._workers_warning_shown = False
+            return
+        if self._workers_warning_shown:
+            return
+
+        self._workers_warning_shown = True
+        messagebox.showwarning(
+            "High VRAM requirement",
+            "Warning: more than 23GB VRAM necessary for more than one instance.",
+            parent=self,
+        )
 
     def _build_ui(self):
         header = tk.Frame(self, bg=HEADER_BG, padx=24, pady=20)
