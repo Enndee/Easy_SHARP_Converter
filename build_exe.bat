@@ -2,10 +2,9 @@
 setlocal EnableDelayedExpansion
 
 set "APP_NAME=Easy_SHARP_Converter"
-set "RELEASE_VERSION=1.5.3"
+set "RELEASE_VERSION=1.5.4"
 set "PACKAGE_DIR=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows"
 set "ZIP_PATH=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows.zip"
-set "VIEWER_SOURCE=splatapult\build\Release"
 
 echo =====================================================
 echo  Easy SHARP Converter  --  Build EXE
@@ -75,6 +74,18 @@ echo [3/5] Building %APP_NAME%.exe ...
     --onefile ^
     --windowed ^
     --name "%APP_NAME%" ^
+    --exclude-module torch ^
+    --exclude-module torchvision ^
+    --exclude-module triton ^
+    --exclude-module scipy ^
+    --exclude-module pandas ^
+    --exclude-module matplotlib ^
+    --exclude-module timm ^
+    --exclude-module sympy ^
+    --exclude-module sharp ^
+    --exclude-module gsplat ^
+    --exclude-module imageio ^
+    --exclude-module pillow_heif ^
     --hidden-import plyfile ^
     --hidden-import numpy ^
      --hidden-import PIL ^
@@ -111,15 +122,6 @@ copy /Y "Launch_Easy_SHARP.bat" "%PACKAGE_DIR%\" >nul
 copy /Y "Setup_NewPC.bat" "%PACKAGE_DIR%\" >nul
 copy /Y "gsbox.exe" "%PACKAGE_DIR%\" >nul
 
-if not exist "%PACKAGE_DIR%\splatapult\build\Release" mkdir "%PACKAGE_DIR%\splatapult\build\Release"
-if exist "%VIEWER_SOURCE%\*" (
-    xcopy /E /I /Y "%VIEWER_SOURCE%\*" "%PACKAGE_DIR%\splatapult\build\Release\" >nul
-) else (
-    echo WARNING: Could not find splatapult viewer files in %VIEWER_SOURCE%.
-    echo          The v%RELEASE_VERSION% package will be built without the bundled viewer payload.
-    rmdir /S /Q "%PACKAGE_DIR%\splatapult" >nul 2>&1
-)
-
 if exist "easy_sharp_settings.json" del /Q "%PACKAGE_DIR%\easy_sharp_settings.json" >nul 2>&1
 
 REM Write a quick README
@@ -128,7 +130,7 @@ REM Write a quick README
     echo ====================
     echo.
     echo REQUIREMENTS FOR A NEW PC
-    echo   1. Windows 11, NVIDIA GPU (RTX 20/30/40/50 series with CUDA)
+    echo   1. Windows 11, NVIDIA GPU ^(RTX 20/30/40/50 series with CUDA^)
     echo   2. Anaconda or Miniconda - https://www.anaconda.com/download
     echo   3. Git for Windows      - https://git-scm.com/download/win
     echo.
@@ -139,7 +141,7 @@ REM Write a quick README
     echo   - Double-click Easy_SHARP_Converter.exe and use the file picker, OR
     echo   - Right-click any JPEG/PNG -^> Send To -^> Easy SHARP Converter
     echo     ^(Setup_NewPC.bat creates the Send To shortcut automatically^)
-    echo   - Double-click splat files in the GUI to open them in the configured viewer
+    echo   - Configure your preferred splat viewer in the GUI to open splat files externally
     echo.
     echo FOLDER STRUCTURE
     echo   Easy_SHARP_Converter.exe  - launcher
@@ -147,12 +149,7 @@ REM Write a quick README
     echo   Launch_Easy_SHARP.bat     - script launcher
     echo   Setup_NewPC.bat           - one-time environment installer
 ) > "%PACKAGE_DIR%\README.txt"
-
-if exist "%PACKAGE_DIR%\splatapult\build\Release" (
-    >> "%PACKAGE_DIR%\README.txt" echo   splatapult\build\Release\ - bundled viewer files
-) else (
-    >> "%PACKAGE_DIR%\README.txt" echo   Viewer payload not bundled in this package.
-)
+>> "%PACKAGE_DIR%\README.txt" echo   Viewer payload not bundled in this package.
 
 echo.
 echo [5/5] Creating zip archive...

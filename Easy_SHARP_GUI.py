@@ -8,6 +8,7 @@ if getattr(sys, "frozen", False):
 
 import collections
 import concurrent.futures
+import importlib.util
 import json
 import math
 import shutil
@@ -29,6 +30,7 @@ from plyfile import PlyData, PlyElement
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 SPLAT_EXTENSIONS = {".ply", ".spx", ".spz", ".sog"}
 CONDA_ENV_NAME = "sharp"
+EXTERNAL_RUNTIME_MODULES = ("torch", "sharp")
 
 BG = "#101418"
 BG2 = "#171c22"
@@ -71,6 +73,8 @@ TAG_ORIENTATION = TAGS_BY_NAME.get("Orientation")
 LANCZOS_FILTER = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 QUALITY_SUFFIX_RE = re.compile(r"^(?P<base>.+?)_q\d+_sh\d+$", re.IGNORECASE)
 TRAILING_INDEX_RE = re.compile(r"^(?P<base>.+)_(?P<index>\d+)$")
+_RUNTIME_DLL_HANDLES = []
+_EXTERNAL_RUNTIME_ACTIVE = False
 
 
 def _creationflags():
@@ -241,6 +245,110 @@ def find_sharp_exe():
     return candidate if os.path.exists(candidate) else None
 
 
+def find_conda_env_dir():
+    base = find_conda_base()
+    if not base:
+        return None
+    candidate = os.path.join(base, "envs", CONDA_ENV_NAME)
+    return candidate if os.path.isdir(candidate) else None
+
+
+def find_conda_env_python():
+    env_dir = find_conda_env_dir()
+    if not env_dir:
+        return None
+    candidate = os.path.join(env_dir, "python.exe")
+    return candidate if os.path.exists(candidate) else None
+
+
+def _conda_env_site_packages():
+    env_dir = find_conda_env_dir()
+    if not env_dir:
+        return None
+    site_packages = os.path.join(env_dir, "Lib", "site-packages")
+    return site_packages if os.path.isdir(site_packages) else None
+
+
+def detect_external_sharp_runtime():
+    env_dir = find_conda_env_dir()
+    if not env_dir:
+        return False, "Conda environment 'sharp' not found."
+
+    python_exe = find_conda_env_python()
+    if not python_exe:
+        return False, "Python executable not found in the 'sharp' conda environment."
+
+    sharp_exe = find_sharp_exe()
+    if not sharp_exe:
+        return False, "SHARP executable not found in the 'sharp' conda environment."
+
+    probe_code = (
+        "import importlib.util, sys; "
+        "missing=[name for name in ('torch','sharp') if importlib.util.find_spec(name) is None]; "
+        "sys.stderr.write(', '.join(missing)); "
+        "raise SystemExit(1 if missing else 0)"
+    )
+    try:
+        result = subprocess.run(
+            [python_exe, "-c", probe_code],
+            capture_output=True,
+            text=True,
+            creationflags=_creationflags(),
+            timeout=20,
+        )
+    except Exception as exc:
+        return False, f"Could not validate the SHARP runtime: {exc}"
+
+    if result.returncode == 0:
+        return True, f"SHARP runtime found in conda env '{CONDA_ENV_NAME}'."
+
+    missing = (result.stderr or result.stdout or "torch, sharp").strip()
+    return False, f"Missing required runtime package(s) in conda env '{CONDA_ENV_NAME}': {missing}."
+
+
+def activate_external_sharp_runtime():
+    global _EXTERNAL_RUNTIME_ACTIVE
+
+    if _EXTERNAL_RUNTIME_ACTIVE:
+        return True, None
+
+    env_dir = find_conda_env_dir()
+    site_packages = _conda_env_site_packages()
+    if not env_dir or not site_packages:
+        return False, "Conda environment 'sharp' is not available."
+
+    probe_paths = [
+        site_packages,
+        os.path.join(env_dir, "Lib", "site-packages", "torch", "lib"),
+        os.path.join(env_dir, "Library", "bin"),
+        os.path.join(env_dir, "Scripts"),
+        env_dir,
+    ]
+
+    for path in reversed(probe_paths):
+        if path and os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
+
+    existing_path = os.environ.get("PATH", "")
+    prepend_paths = [path for path in probe_paths[1:] if path and os.path.isdir(path)]
+    if prepend_paths:
+        os.environ["PATH"] = os.pathsep.join(prepend_paths + [existing_path]) if existing_path else os.pathsep.join(prepend_paths)
+
+    if hasattr(os, "add_dll_directory"):
+        for path in prepend_paths:
+            try:
+                _RUNTIME_DLL_HANDLES.append(os.add_dll_directory(path))
+            except OSError:
+                pass
+
+    missing = [name for name in EXTERNAL_RUNTIME_MODULES if importlib.util.find_spec(name) is None]
+    if missing:
+        return False, f"Missing required runtime package(s): {', '.join(missing)}."
+
+    _EXTERNAL_RUNTIME_ACTIVE = True
+    return True, None
+
+
 def find_gsbox_exe(configured_path=""):
     candidates = []
     if configured_path:
@@ -393,6 +501,10 @@ class _SHARPEngine:
     _INTERNAL_SIZE = (1536, 1536)
 
     def __init__(self, device="cuda", log_fn=None):
+        runtime_ready, runtime_error = activate_external_sharp_runtime()
+        if not runtime_ready:
+            raise RuntimeError(runtime_error)
+
         import torch
         from sharp.models import create_predictor, PredictorParams
         from sharp.cli.predict import DEFAULT_MODEL_URL
@@ -805,6 +917,8 @@ class App(tk.Tk):
         self._bind_settings()
         self._sync_output_mode()
         self._check_tools()
+        self._runtime_install_prompted = False
+        self.after(100, self._ensure_runtime_installed_on_startup)
         self.bind_all("<Delete>", self._on_delete_key, add=True)
         self._log(f"Session started. Log file: {self._log_file_path}", "dim")
 
@@ -1415,13 +1529,16 @@ class App(tk.Tk):
         self.after(0, apply_state)
 
     def _check_tools(self):
-        sharp_exe = find_sharp_exe()
+        runtime_ok, runtime_message = detect_external_sharp_runtime()
         gsbox_exe = find_gsbox_exe(self.gsbox_var.get())
 
-        if sharp_exe:
-            self._log(f"SHARP found: {sharp_exe}", "ok")
+        if runtime_ok:
+            sharp_exe = find_sharp_exe()
+            self._log(runtime_message, "ok")
+            self._log(f"SHARP executable found: {sharp_exe}", "ok")
         else:
-            self._log("SHARP not found. Use Launch_SHARP_GUI.bat so the sharp conda environment is active.", "err")
+            self._log(runtime_message, "err")
+            self._log("Easy SHARP Converter can launch Setup_NewPC.bat to install SHARP and PyTorch on first start.", "warn")
 
         if gsbox_exe:
             if not self.gsbox_var.get():
@@ -1430,6 +1547,55 @@ class App(tk.Tk):
             self._log("gsbox handles transform plus .spx, .spz, and .sog export.", "dim")
         else:
             self._log("gsbox.exe not found yet. It is required for transforms and .spx/.spz/.sog export.", "warn")
+
+    def _launch_runtime_installer(self):
+        installer_path = os.path.join(EXE_DIR, "Setup_NewPC.bat")
+        if not os.path.exists(installer_path):
+            self._log("Setup_NewPC.bat not found next to the application.", "err")
+            return False
+
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", installer_path],
+                cwd=EXE_DIR,
+                creationflags=_creationflags(),
+            )
+        except Exception as exc:
+            self._log(f"Could not launch Setup_NewPC.bat: {exc}", "err")
+            return False
+
+        self._log("Launched Setup_NewPC.bat. Finish the installer, then restart Easy SHARP Converter.", "warn")
+        return True
+
+    def _prompt_runtime_installer(self, message, *, force=False):
+        if self._runtime_install_prompted and not force:
+            return False
+
+        self._runtime_install_prompted = True
+        should_install = messagebox.askyesno(
+            "Install SHARP Runtime",
+            f"{message}\n\nRun Setup_NewPC.bat now to install SHARP and PyTorch?",
+            parent=self,
+            icon="warning",
+        )
+        if not should_install:
+            self._log("SHARP runtime install was skipped by the user.", "warn")
+            return False
+        if not self._launch_runtime_installer():
+            return False
+
+        messagebox.showinfo(
+            "Installer Started",
+            "Setup_NewPC.bat has been launched. After it finishes, restart Easy SHARP Converter.",
+            parent=self,
+        )
+        return True
+
+    def _ensure_runtime_installed_on_startup(self):
+        runtime_ok, runtime_message = detect_external_sharp_runtime()
+        if runtime_ok:
+            return
+        self._prompt_runtime_installer(runtime_message)
 
     def _open_initial_target(self, target):
         target = os.path.normpath(target) if target else self.path_var.get()
@@ -2121,6 +2287,12 @@ class App(tk.Tk):
 
         sharp_exe = None
         if has_images:
+            runtime_ok, runtime_message = detect_external_sharp_runtime()
+            if not runtime_ok:
+                self._log(runtime_message, "err")
+                self._prompt_runtime_installer(runtime_message, force=True)
+                return None
+
             sharp_exe = find_sharp_exe()
             if not sharp_exe:
                 self._log("SHARP executable not found.", "err")
