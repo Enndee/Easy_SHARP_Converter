@@ -2,6 +2,8 @@
 
 Easy SHARP Converter is a fullscreen Windows GUI for converting images and existing splat files with Apple's SHARP model and `gsbox`.
 
+https://github.com/user-attachments/assets/cde029e1-1a8d-464a-9049-11ee167f68fb
+
 ## Features
 
 - Batch image conversion with parallel SHARP inference
