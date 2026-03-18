@@ -67,6 +67,7 @@ SETTINGS_PATH = os.path.join(EXE_DIR, "easy_sharp_settings.json")
 TAGS_BY_NAME = {name: tag for tag, name in ExifTags.TAGS.items()}
 TAG_FOCAL = TAGS_BY_NAME.get("FocalLength")
 TAG_FOCAL_35 = TAGS_BY_NAME.get("FocalLengthIn35mmFilm")
+TAG_ORIENTATION = TAGS_BY_NAME.get("Orientation")
 LANCZOS_FILTER = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 QUALITY_SUFFIX_RE = re.compile(r"^(?P<base>.+?)_q\d+_sh\d+$", re.IGNORECASE)
 TRAILING_INDEX_RE = re.compile(r"^(?P<base>.+)_(?P<index>\d+)$")
@@ -313,24 +314,38 @@ def extract_focal_length(image_path):
     return None
 
 
+def _prepare_sharp_input_pil(image):
+    return ImageOps.mirror(ImageOps.exif_transpose(image))
+
+
 def copy_image_with_fallback_focal(source_path, output_path, fallback_focal):
-    if fallback_focal is None:
-        shutil.copy2(source_path, output_path)
-        return False
+    with Image.open(source_path) as source_image:
+        image_format = source_image.format
+        exif = source_image.getexif() or Image.Exif()
+        has_exif_focal = bool(exif.get(TAG_FOCAL_35) or exif.get(TAG_FOCAL))
 
-    if extract_focal_length(source_path) is not None:
-        shutil.copy2(source_path, output_path)
-        return False
+        image = _prepare_sharp_input_pil(source_image)
+        if TAG_ORIENTATION:
+            exif[TAG_ORIENTATION] = 1
 
-    with Image.open(source_path) as image:
-        image = ImageOps.exif_transpose(image)
-        exif = image.getexif() or Image.Exif()
-        if TAG_FOCAL:
-            exif[TAG_FOCAL] = TiffImagePlugin.IFDRational(float(fallback_focal))
-        if TAG_FOCAL_35:
-            exif[TAG_FOCAL_35] = int(round(float(fallback_focal)))
-        image.save(output_path, format=image.format, exif=exif)
-    return True
+        applied_fallback = False
+        if fallback_focal is not None and not has_exif_focal:
+            if TAG_FOCAL:
+                exif[TAG_FOCAL] = TiffImagePlugin.IFDRational(float(fallback_focal))
+            if TAG_FOCAL_35:
+                exif[TAG_FOCAL_35] = int(round(float(fallback_focal)))
+            applied_fallback = True
+
+        save_kwargs = {"format": image_format}
+        exif_bytes = exif.tobytes() if hasattr(exif, "tobytes") else None
+        if exif_bytes:
+            save_kwargs["exif"] = exif_bytes
+        if image_format and image_format.upper() in {"JPEG", "JPG"}:
+            save_kwargs["quality"] = "keep"
+            save_kwargs["subsampling"] = "keep"
+
+        image.save(output_path, **save_kwargs)
+    return applied_fallback
 
 
 def load_thumbnail_payload(image_path, background_color):
@@ -435,6 +450,7 @@ class _SHARPEngine:
         from sharp.utils.io import load_rgb, convert_focallength
 
         image, _, f_px = load_rgb(Path(image_path))
+        image = image[:, ::-1, :].copy()
         height, width = image.shape[:2]
 
         if fallback_focal_mm is not None:
@@ -2158,8 +2174,8 @@ class App(tk.Tk):
         temp_root = tempfile.mkdtemp(prefix="easy_sharp_")
         batch_started = time.perf_counter()
         sharp_elapsed = 0.0
-        post_elapsed = 0.0
         sharp_engine = None
+        export_executor = None
         try:
             self._set_status("Preparing temporary workspace...")
             raw_dir = os.path.join(temp_root, "raw_ply")
@@ -2177,24 +2193,78 @@ class App(tk.Tk):
                     self._log(f"Direct SHARP API unavailable ({exc}). Using subprocess fallback.", "warn")
                     sharp_engine = None
 
+            image_entries = [e for e in entries if e["source_kind"] == "image"]
+            splat_entries = [e for e in entries if e["source_kind"] != "image"]
+
             if use_direct:
-                image_entries = [e for e in entries if e["source_kind"] == "image"]
                 self._configure_progress(len(image_entries) + len(entries) + 2, f"Prepared {len(entries)} file(s)")
-                self._advance_progress(1, "Input batch ready")
-                sharp_started = time.perf_counter()
-                self._run_sharp_direct(image_entries, raw_dir, sharp_engine, settings)
-                sharp_elapsed = time.perf_counter() - sharp_started
             else:
                 chunk_dirs = self._prepare_chunks(entries)
                 self._configure_progress(len(chunk_dirs) + len(entries) + 2, f"Prepared {len(entries)} file(s)")
-                self._advance_progress(1, "Input batch ready")
-                sharp_started = time.perf_counter()
-                self._run_sharp_instances(chunk_dirs, raw_dir, settings)
-                sharp_elapsed = time.perf_counter() - sharp_started
+            self._advance_progress(1, "Input batch ready")
 
-            post_started = time.perf_counter()
-            self._postprocess_outputs(entries, raw_dir, settings, temp_root)
-            post_elapsed = time.perf_counter() - post_started
+            # -- Pipelined export: CPU export starts as PLY files land on disk --
+            export_workers = max(1, min(len(entries), settings["conversion_workers"]))
+            export_executor = concurrent.futures.ThreadPoolExecutor(max_workers=export_workers)
+            export_futures = {}
+            exported_count = [0]
+            export_lock = threading.Lock()
+
+            def _on_export_done(future, entry):
+                try:
+                    final_path = future.result()
+                    with export_lock:
+                        exported_count[0] += 1
+                        count = exported_count[0]
+                    self._advance_progress(1, f"Exported {count}/{len(entries)}")
+                    self._log(f"Exported {os.path.basename(entry['source_path'])} -> {final_path}", "ok")
+                except Exception:
+                    pass  # errors collected in the as_completed loop
+
+            def _submit_for_export(ready_entries):
+                """Submit entries whose raw PLY files are ready for CPU export."""
+                for entry in ready_entries:
+                    raw_ply = None
+                    if entry["source_kind"] == "image":
+                        raw_ply = os.path.join(raw_dir, f"{entry['temp_stem']}.ply")
+                    fut = export_executor.submit(
+                        self._export_single_entry, entry, raw_ply, settings, temp_root,
+                    )
+                    export_futures[fut] = entry
+                    fut.add_done_callback(lambda f, e=entry: _on_export_done(f, e))
+
+            # Submit splat-only entries immediately (they bypass SHARP)
+            if splat_entries:
+                _submit_for_export(splat_entries)
+
+            sharp_started = time.perf_counter()
+            if use_direct:
+                self._run_sharp_direct(
+                    image_entries, raw_dir, sharp_engine, settings,
+                    on_ply_ready=_submit_for_export,
+                )
+            else:
+                chunk_entries_map = {}
+                for entry in image_entries:
+                    chunk_entries_map.setdefault(entry["chunk_dir"], []).append(entry)
+                self._run_sharp_instances(
+                    chunk_dirs, raw_dir, settings,
+                    on_chunk_ready=_submit_for_export,
+                    chunk_entries_map=chunk_entries_map,
+                )
+            sharp_elapsed = time.perf_counter() - sharp_started
+
+            # Wait for all pipelined exports to complete
+            self._set_status("Finishing exports...")
+            for future in concurrent.futures.as_completed(export_futures):
+                exc = future.exception()
+                if exc is not None:
+                    entry = export_futures[future]
+                    raise RuntimeError(
+                        f"Export failed for {os.path.basename(entry['source_path'])}: {exc}"
+                    )
+            export_executor.shutdown(wait=True)
+
             total_elapsed = time.perf_counter() - batch_started
             avg_elapsed = total_elapsed / max(1, len(entries))
             self._set_status("Finished")
@@ -2203,7 +2273,7 @@ class App(tk.Tk):
             mode_tag = "direct" if use_direct else "subprocess"
             self._log(
                 f"Performance ({mode_tag}): total={_format_duration(total_elapsed)}, average/file={_format_duration(avg_elapsed)}, "
-                f"SHARP={_format_duration(sharp_elapsed)}, post={_format_duration(post_elapsed)}",
+                f"SHARP={_format_duration(sharp_elapsed)} (export pipelined on CPU)",
                 "dim",
             )
             preferred_directory = settings["output_folder"] if settings["output_mode"] == "custom" else self._current_dir
@@ -2218,6 +2288,8 @@ class App(tk.Tk):
         finally:
             if sharp_engine is not None:
                 sharp_engine.release()
+            if export_executor is not None:
+                export_executor.shutdown(wait=True)
             shutil.rmtree(temp_root, ignore_errors=True)
             self._set_running(False)
 
@@ -2278,13 +2350,17 @@ class App(tk.Tk):
             self._log(f"  {os.path.basename(chunk_dir)}: {count} image(s)", "dim")
         return [chunk_dir for chunk_dir, count in chunk_dirs.items() if count > 0]
 
-    def _run_sharp_direct(self, image_entries, raw_dir, engine, settings):
+    def _run_sharp_direct(self, image_entries, raw_dir, engine, settings, on_ply_ready=None):
         """Run SHARP inference in-process with batched forward passes.
 
         Images are grouped into batches (size = workers setting).  Each batch:
         1. Preloads all images in parallel on background threads.
         2. Runs a single batched forward pass through the model.
         3. Unprojjects + writes each PLY in parallel on background threads.
+
+        If *on_ply_ready* is provided it is called with the list of entries
+        whose PLY files have just been flushed to disk, allowing the caller to
+        start CPU-bound export work while the GPU processes the next batch.
 
         If a batch causes an OOM, the batch size is halved automatically.
         """
@@ -2312,6 +2388,7 @@ class App(tk.Tk):
             for i in range(first_end)
         ]
         save_futures = []   # outstanding PLY writes
+        prev_batch_entries = []  # entries whose PLY writes are in save_futures
 
         idx = 0
         while idx < n:
@@ -2366,6 +2443,10 @@ class App(tk.Tk):
                 f.result()
             save_futures.clear()
 
+            # Previous batch PLYs are on disk — hand them off for export
+            if on_ply_ready is not None and prev_batch_entries:
+                on_ply_ready(prev_batch_entries)
+
             # Per-image: unproject + save PLY (parallel on thread pool)
             for i, (entry, pdata) in enumerate(zip(batch_entries, preloaded)):
                 _, _, f_px, height, width = pdata
@@ -2391,14 +2472,21 @@ class App(tk.Tk):
                 f"{_format_duration(avg)}/img): {names}",
                 "ok",
             )
+            prev_batch_entries = batch_entries
             idx = batch_end
 
         # Wait for final PLY writes
         for f in save_futures:
             f.result()
+
+        # Hand off last batch for export
+        if on_ply_ready is not None and prev_batch_entries:
+            on_ply_ready(prev_batch_entries)
+
         io_pool.shutdown(wait=False)
 
-    def _run_sharp_instances(self, chunk_dirs, raw_dir, settings):
+    def _run_sharp_instances(self, chunk_dirs, raw_dir, settings,
+                             on_chunk_ready=None, chunk_entries_map=None):
         if not chunk_dirs:
             self._log("No image inputs selected. Skipping SHARP stage.", "dim")
             return
@@ -2430,6 +2518,9 @@ class App(tk.Tk):
                     raise RuntimeError(f"SHARP failed for {name}: {stderr}")
                 self._advance_progress(1, f"SHARP complete: {name}")
                 self._log(f"SHARP finished for {name}.", "ok")
+                # Hand off completed chunk entries for CPU export immediately
+                if on_chunk_ready is not None and chunk_entries_map is not None:
+                    on_chunk_ready(chunk_entries_map.get(chunk_dir, []))
 
     def _postprocess_outputs(self, entries, raw_dir, settings, temp_root):
         self._set_status("Post-processing outputs...")
