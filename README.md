@@ -31,4 +31,4 @@ Run `build_exe.bat` from a machine where the `sharp` conda environment already e
 - `Launch_SHARP_GUI.bat`
 - `Setup_NewPC.bat`
 - `gsbox.exe`
-- `splatapult/build/Release/`
+- `README.txt`

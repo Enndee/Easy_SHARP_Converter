@@ -423,7 +423,7 @@ def extract_focal_length(image_path):
 
 
 def _prepare_sharp_input_pil(image):
-    return ImageOps.mirror(ImageOps.exif_transpose(image))
+    return ImageOps.exif_transpose(image)
 
 
 def copy_image_with_fallback_focal(source_path, output_path, fallback_focal):
@@ -562,7 +562,6 @@ class _SHARPEngine:
         from sharp.utils.io import load_rgb, convert_focallength
 
         image, _, f_px = load_rgb(Path(image_path))
-        image = image[:, ::-1, :].copy()
         height, width = image.shape[:2]
 
         if fallback_focal_mm is not None:

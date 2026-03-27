@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 set "APP_NAME=Easy_SHARP_Converter"
-set "RELEASE_VERSION=1.5.4"
+set "RELEASE_VERSION=1.5.5"
 set "PACKAGE_DIR=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows"
 set "ZIP_PATH=release_pkg\%APP_NAME%_v%RELEASE_VERSION%_Windows.zip"
 
